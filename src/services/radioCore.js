@@ -6,6 +6,11 @@ import { env } from '../config/env.js';
 
 const CMD_SET_VOLUME = 'setVolume';
 
+/** Clamp a volume value to the valid [0, 100] range */
+function clampVolume(v) {
+  return Math.max(0, Math.min(100, Math.round(v)));
+}
+
 export class RadioCore {
   constructor({ ytm, queue, playAudioFile, publishState }) {
     this.ytm = ytm;
@@ -180,32 +185,52 @@ export class RadioCore {
     }
   }
 
+  /**
+   * Baja el volumen de YTMDesktop al valor `duckVolume`, reproduce el
+   * archivo de audio y espera a que termine COMPLETAMENTE antes de
+   * restaurar el volumen original.
+   *
+   * La causa del bug anterior era que playAudioFile (PowerShell
+   * Start-Process) retornaba nada más lanzar el media player, por lo
+   * que el finally restauraba el volumen a los ~2 segundos. Ahora
+   * playAudioFile bloquea hasta que el audio acaba de verdad.
+   *
+   * @param {string} filePath  Ruta al archivo de audio a reproducir
+   * @param {number} duckVolume  Volumen reducido durante la locución (0-100)
+   */
   async duckAndPlayTts(filePath, duckVolume = 22) {
     let originalVolume = 50;
     this.isSpeaking = true;
 
     try {
       const state = this.currentState || await this.ytm.getState();
-      originalVolume =
+      originalVolume = clampVolume(
         state?.player?.volumePercent ??
         state?.player?.volume ??
-        50;
+        50
+      );
     } catch (e) {
       logger.warn(`No se pudo leer el volumen actual: ${e.message}`);
     }
 
+    const safeDuck = clampVolume(duckVolume);
+    logger.info(`Duck de volumen: ${originalVolume} -> ${safeDuck} (reproduciendo TTS)`);
+
     try {
-      await this.ytm.command(CMD_SET_VOLUME, duckVolume);
+      await this.ytm.command(CMD_SET_VOLUME, safeDuck);
     } catch (e) {
       logger.warn(`No se pudo bajar el volumen: ${e.message}`);
     }
 
     try {
+      // playAudioFile ahora bloquea hasta que el audio termina por
+      // completo, por lo que el finally se ejecuta en el momento correcto.
       await this.playAudioFile(filePath);
     } catch (e) {
       logger.error(`Error reproduciendo TTS: ${e.message}`);
     } finally {
       try {
+        logger.info(`Restaurando volumen a ${originalVolume}`);
         await this.ytm.command(CMD_SET_VOLUME, originalVolume);
       } catch (e) {
         logger.warn(`No se pudo restaurar el volumen: ${e.message}`);
