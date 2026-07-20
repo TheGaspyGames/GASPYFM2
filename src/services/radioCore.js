@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { fetchNewsHeadlines } from '../news/rss.js';
 import { synthesizeToFile } from './tts.js';
 import { logger } from './logger.js';
@@ -90,7 +91,8 @@ export class RadioCore {
       : 'No se pudieron cargar titulares ahora mismo.';
 
     const filePath = await synthesizeToFile(spokenText, 'bulletin.mp3');
-    await this.duckAndPlayTts(filePath, 20);
+    // Volumen más bajo para el boletín (15) para que suene como radio de verdad
+    await this.duckAndPlayTts(filePath, 15);
     this.lastBulletinAt = Date.now();
 
     logger.info('Boletín emitido');
@@ -141,12 +143,22 @@ export class RadioCore {
       logger.warn(`No se pudo bajar el volumen: ${e.message}`);
     }
 
-    await this.playAudioFile(filePath);
-
     try {
-      await this.ytm.command('player-set-volume', originalVolume);
-    } catch (e) {
-      logger.warn(`No se pudo restaurar el volumen: ${e.message}`);
+      await this.playAudioFile(filePath);
+    } finally {
+      // Restaurar volumen SIEMPRE, aunque playAudioFile falle
+      try {
+        await this.ytm.command('player-set-volume', originalVolume);
+      } catch (e) {
+        logger.warn(`No se pudo restaurar el volumen: ${e.message}`);
+      }
+
+      // Limpiar el archivo TTS para no llenar el disco
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // silencioso, no crítico
+      }
     }
   }
 }

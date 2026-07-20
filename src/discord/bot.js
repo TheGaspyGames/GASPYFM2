@@ -16,6 +16,18 @@ const stateStore = new JsonStore('discord-state-message.json', {
   messageId: ''
 });
 
+/** Formatea segundos a m:ss o h:mm:ss */
+function formatDuration(secs) {
+  const s = Math.max(0, Math.floor(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  }
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
 export class GaspyBot {
   constructor({ queue, getCurrentState, triggerBulletin, scheduleGreetingTts }) {
     this.queue = queue;
@@ -23,21 +35,41 @@ export class GaspyBot {
     this.triggerBulletin = triggerBulletin;
     this.scheduleGreetingTts = scheduleGreetingTts;
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
-    this.stateChannelId = env.stateEmbedChannelId || '';
+    this.stateChannelId = env.stateEmbedChannelId || null;
     this.stateMessage = stateStore.read();
+    this.lastPublishedKey = null;
     this.stateMessagePromise = null;
-    this.lastPublishedKey = '';
   }
 
   commands() {
     return [
-      new SlashCommandBuilder().setName('sonando').setDescription('Muestra lo que está sonando ahora'),
-      new SlashCommandBuilder().setName('cola').setDescription('Muestra la cola de peticiones'),
-      new SlashCommandBuilder().setName('boletin').setDescription('Fuerza un boletín manual'),
-      new SlashCommandBuilder().setName('pedir').setDescription('Pide una canción con dedicatoria opcional')
-        .addStringOption(o => o.setName('cancion').setDescription('Texto o link de la canción').setRequired(true))
-        .addStringOption(o => o.setName('dedicar_a').setDescription('A quién va dedicada').setRequired(false))
-        .addStringOption(o => o.setName('mensaje').setDescription('Mensaje corto').setRequired(false))
+      new SlashCommandBuilder()
+        .setName('sonando')
+        .setDescription('Ver qué está sonando ahora mismo'),
+      new SlashCommandBuilder()
+        .setName('cola')
+        .setDescription('Ver las próximas peticiones en cola'),
+      new SlashCommandBuilder()
+        .setName('boletin')
+        .setDescription('Forzar un boletín de noticias ahora'),
+      new SlashCommandBuilder()
+        .setName('pedir')
+        .setDescription('Pedir una canción')
+        .addStringOption(opt =>
+          opt.setName('cancion')
+            .setDescription('Nombre o URL de la canción')
+            .setRequired(true)
+        )
+        .addStringOption(opt =>
+          opt.setName('dedicar_a')
+            .setDescription('Dedicar la canción a alguien')
+            .setRequired(false)
+        )
+        .addStringOption(opt =>
+          opt.setName('mensaje')
+            .setDescription('Mensaje para leer en antena')
+            .setRequired(false)
+        )
     ].map(c => c.toJSON());
   }
 
@@ -57,11 +89,11 @@ export class GaspyBot {
     const embed = new EmbedBuilder()
       .setColor(0x01696f)
       .setTitle(video?.title || 'Sin reproducción')
-      .setDescription(state?.player?.trackState === 1 ? 'Emitiendo ahora' : 'En pausa o sin señal')
+      .setDescription(state?.player?.trackState === 1 ? '🔴 Emitiendo ahora' : '⏸ En pausa o sin señal')
       .addFields(
         { name: 'Artista', value: video?.author || 'Desconocido', inline: true },
-        { name: 'Duración', value: String(video?.durationSeconds || 0), inline: true },
-        { name: 'Próxima petición', value: queueItem ? queueItem.song : 'Sin peticiones', inline: false }
+        { name: 'Duración', value: formatDuration(video?.durationSeconds || 0), inline: true },
+        { name: 'Próxima petición', value: queueItem ? `${queueItem.song} · de ${queueItem.requestedBy}` : 'Sin peticiones', inline: false }
       )
       .setFooter({ text: 'GASPYFM · Sonando ahora' })
       .setTimestamp(new Date());
@@ -173,8 +205,9 @@ export class GaspyBot {
         const state = this.getCurrentState();
         const title = state?.video?.title || 'Nada claro todavía';
         const author = state?.video?.author || 'Desconocido';
+        const dur = formatDuration(state?.video?.durationSeconds || 0);
         return interaction.reply({
-          content: `Ahora mismo suena: ${title} — ${author}`,
+          content: `🎵 Ahora suena: **${title}** — ${author} \`${dur}\``,
           ephemeral: true
         });
       }
@@ -188,7 +221,7 @@ export class GaspyBot {
       }
 
       if (interaction.commandName === 'boletin') {
-        await interaction.reply({ content: 'Boletín lanzado.', ephemeral: true });
+        await interaction.reply({ content: '📰 Boletín lanzado.', ephemeral: true });
         return this.triggerBulletin();
       }
 
@@ -199,7 +232,7 @@ export class GaspyBot {
 
         if (!this.queue.canRequest(interaction.user.id, env.requestCooldownSeconds)) {
           return interaction.reply({
-            content: `Debes esperar ${env.requestCooldownSeconds} segundos entre peticiones.`,
+            content: `⏳ Debes esperar ${env.requestCooldownSeconds} segundos entre peticiones.`,
             ephemeral: true
           });
         }
@@ -211,7 +244,7 @@ export class GaspyBot {
           resolved = await resolveRequestSong(song);
         } catch (e) {
           return interaction.editReply({
-            content: `No pude resolver esa petición: ${e.message}`
+            content: `❌ No pude resolver esa petición: ${e.message}`
           });
         }
 
@@ -230,7 +263,7 @@ export class GaspyBot {
         await this.publishState();
 
         return interaction.editReply({
-          content: `Petición añadida: ${item.song}${item.dedicateTo ? ` · dedicada a ${item.dedicateTo}` : ''}`
+          content: `✅ Petición añadida: **${item.song}**${item.dedicateTo ? ` · dedicada a ${item.dedicateTo}` : ''}`
         });
       }
     });

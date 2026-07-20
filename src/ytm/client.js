@@ -48,6 +48,7 @@ export class YtmClient {
   }
 
   async ensureAuth() {
+    // Si ya tenemos token, no re-autenticar en cada request
     if (this.token) return this.token;
 
     const code = await this.requestCode();
@@ -78,7 +79,8 @@ export class YtmClient {
   }
 
   async request(path, options = {}) {
-    await this.ensureAuth();
+    // Solo llamar ensureAuth si no hay token todavía
+    if (!this.token) await this.ensureAuth();
 
     const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
     if (this.token) headers.Authorization = this.token;
@@ -98,13 +100,13 @@ export class YtmClient {
   }
 
   async getState() {
-    await this.ensureAuth();
+    if (!this.token) await this.ensureAuth();
     this.state = await this.request('/state', { method: 'GET' });
     return this.state;
   }
 
   async command(command, data) {
-    await this.ensureAuth();
+    if (!this.token) await this.ensureAuth();
     return this.request('/command', {
       method: 'POST',
       body: JSON.stringify(
@@ -114,7 +116,7 @@ export class YtmClient {
   }
 
   async connectRealtime(onState) {
-    await this.ensureAuth();
+    if (!this.token) await this.ensureAuth();
 
     const apiUrl = new URL(env.ytmApiBase);
     const origin = `${apiUrl.protocol}//${apiUrl.host}`;
