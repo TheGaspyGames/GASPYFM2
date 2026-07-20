@@ -1,0 +1,16 @@
+{
+  "name": "gaspyfm-radio-tts",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "check:yt": "yt-dlp --version"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "socket.io-client": "^4.8.1",
+    "node-edge-tts": "^1.2.8"
+  }
+}
