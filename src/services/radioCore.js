@@ -4,19 +4,38 @@ import { synthesizeToFile } from './tts.js';
 import { logger } from './logger.js';
 import { env } from '../config/env.js';
 
+const CMD_SET_VOLUME = 'setVolume';
+
 export class RadioCore {
   constructor({ ytm, queue, playAudioFile, publishState }) {
     this.ytm = ytm;
     this.queue = queue;
     this.playAudioFile = playAudioFile;
     this.publishState = publishState;
+
     this.currentState = null;
     this.lastBulletinAt = 0;
     this.lastVideoId = null;
     this.isHandlingTransition = false;
+    this.isSpeaking = false;
+    this.pendingRefresh = false;
   }
 
   getCurrentState = () => this.currentState;
+
+  enqueueRequest(request) {
+    this.queue.push(request);
+    logger.info(`Petición encolada: ${request.videoId} · ${request.song}`);
+    return { queued: true, position: this.queue.length };
+  }
+
+  async safePublishState() {
+    try {
+      await this.publishState?.(this.currentState);
+    } catch (e) {
+      logger.warn(`No se pudo publicar estado en Discord: ${e.message}`);
+    }
+  }
 
   async handleStateUpdate(state) {
     const previousVideoId = this.lastVideoId;
@@ -25,18 +44,19 @@ export class RadioCore {
     this.currentState = state;
     this.lastVideoId = currentVideoId;
 
-    try {
-      await this.publishState?.(this.currentState);
-    } catch (e) {
-      logger.warn(`No se pudo publicar estado en Discord: ${e.message}`);
-    }
+    await this.safePublishState();
 
     const changedSong =
       currentVideoId &&
       previousVideoId &&
       currentVideoId !== previousVideoId;
 
-    if (changedSong && !this.isHandlingTransition) {
+    if (changedSong) {
+      logger.info(`Cambio de canción detectado: ${previousVideoId} -> ${currentVideoId}`);
+      this.pendingRefresh = true;
+    }
+
+    if (changedSong && !this.isHandlingTransition && !this.isSpeaking) {
       this.isHandlingTransition = true;
       try {
         await this.handlePostSongTransition();
@@ -48,8 +68,7 @@ export class RadioCore {
 
   async handlePostSongTransition() {
     const now = Date.now();
-    const newsDue =
-      now - this.lastBulletinAt >= env.newsIntervalMinutes * 60 * 1000;
+    const newsDue = now - this.lastBulletinAt >= env.newsIntervalMinutes * 60 * 1000;
 
     if (newsDue) {
       await this.speakBulletin();
@@ -60,7 +79,13 @@ export class RadioCore {
 
   async playNextRequestIfAny() {
     const next = this.queue.shift();
-    if (!next?.videoId) return;
+    if (!next?.videoId) {
+      if (this.pendingRefresh) {
+        this.pendingRefresh = false;
+        await this.safePublishState();
+      }
+      return;
+    }
 
     if (next.dedicateTo || next.message) {
       await this.speakGreeting(next);
@@ -68,18 +93,28 @@ export class RadioCore {
 
     try {
       await this.ytm.command('changeVideo', {
-        videoId: next.videoId
+        videoId: next.videoId,
+        playlistId: null
       });
-      logger.info(`Reproduciendo petición: ${next.videoId} · ${next.song}`);
+      logger.info(`Reproduciendo petición al terminar canción actual: ${next.videoId} · ${next.song}`);
     } catch (e) {
       logger.error(`No se pudo reproducir la petición: ${e.message}`);
+      return;
     }
 
+    this.pendingRefresh = false;
+
     try {
-      await this.publishState?.(this.currentState);
+      const latestState = await this.ytm.getState();
+      if (latestState) {
+        this.currentState = latestState;
+        this.lastVideoId = latestState?.video?.id || this.lastVideoId;
+      }
     } catch (e) {
-      logger.warn(`No se pudo refrescar estado tras petición: ${e.message}`);
+      logger.warn(`No se pudo leer estado actualizado tras petición: ${e.message}`);
     }
+
+    await this.safePublishState();
   }
 
   async speakBulletin() {
@@ -91,17 +126,29 @@ export class RadioCore {
       : 'No se pudieron cargar titulares ahora mismo.';
 
     const filePath = await synthesizeToFile(spokenText, 'bulletin.mp3');
-    // Volumen más bajo para el boletín (15) para que suene como radio de verdad
-    await this.duckAndPlayTts(filePath, 15);
-    this.lastBulletinAt = Date.now();
-
-    logger.info('Boletín emitido');
 
     try {
-      await this.publishState?.(this.currentState);
+      await this.duckAndPlayTts(filePath, 15);
+      this.lastBulletinAt = Date.now();
+      logger.info('Boletín emitido');
+    } finally {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        logger.warn(`No se pudo eliminar boletín temporal: ${e.message}`);
+      }
+    }
+
+    try {
+      const latestState = await this.ytm.getState();
+      if (latestState) {
+        this.currentState = latestState;
+      }
     } catch (e) {
       logger.warn(`No se pudo refrescar estado tras boletín: ${e.message}`);
     }
+
+    await this.safePublishState();
   }
 
   async speakGreeting(request) {
@@ -121,11 +168,21 @@ export class RadioCore {
 
     const text = parts.join(' ');
     const filePath = await synthesizeToFile(text, `greeting-${request.id}.mp3`);
-    await this.duckAndPlayTts(filePath, 26);
+
+    try {
+      await this.duckAndPlayTts(filePath, 26);
+    } finally {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        logger.warn(`No se pudo eliminar TTS temporal: ${e.message}`);
+      }
+    }
   }
 
   async duckAndPlayTts(filePath, duckVolume = 22) {
     let originalVolume = 50;
+    this.isSpeaking = true;
 
     try {
       const state = this.currentState || await this.ytm.getState();
@@ -138,27 +195,22 @@ export class RadioCore {
     }
 
     try {
-      await this.ytm.command('player-set-volume', duckVolume);
+      await this.ytm.command(CMD_SET_VOLUME, duckVolume);
     } catch (e) {
       logger.warn(`No se pudo bajar el volumen: ${e.message}`);
     }
 
     try {
       await this.playAudioFile(filePath);
+    } catch (e) {
+      logger.error(`Error reproduciendo TTS: ${e.message}`);
     } finally {
-      // Restaurar volumen SIEMPRE, aunque playAudioFile falle
       try {
-        await this.ytm.command('player-set-volume', originalVolume);
+        await this.ytm.command(CMD_SET_VOLUME, originalVolume);
       } catch (e) {
         logger.warn(`No se pudo restaurar el volumen: ${e.message}`);
       }
-
-      // Limpiar el archivo TTS para no llenar el disco
-      try {
-        fs.unlinkSync(filePath);
-      } catch {
-        // silencioso, no crítico
-      }
+      this.isSpeaking = false;
     }
   }
 }

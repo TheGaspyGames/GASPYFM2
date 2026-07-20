@@ -11,21 +11,23 @@ import { env } from '../config/env.js';
 import { JsonStore } from '../utils/jsonStore.js';
 import { logger } from '../services/logger.js';
 
-const stateStore = new JsonStore('discord-state-message.json', {
-  channelId: '',
-  messageId: ''
-});
+const stateStore = new JsonStore('discord-state-message.json', { channelId: '', messageId: '' });
 
-/** Formatea segundos a m:ss o h:mm:ss */
 function formatDuration(secs) {
-  const s = Math.max(0, Math.floor(secs));
+  const s = Math.max(0, Math.floor(secs || 0));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
-  }
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function formatCooldown(secs) {
+  const safe = Math.max(0, Math.floor(secs || 0));
+  if (safe < 60) return `${safe}s`;
+  const m = Math.floor(safe / 60);
+  const s = safe % 60;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
 export class GaspyBot {
@@ -34,6 +36,7 @@ export class GaspyBot {
     this.getCurrentState = getCurrentState;
     this.triggerBulletin = triggerBulletin;
     this.scheduleGreetingTts = scheduleGreetingTts;
+
     this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
     this.stateChannelId = env.stateEmbedChannelId || null;
     this.stateMessage = stateStore.read();
@@ -57,7 +60,7 @@ export class GaspyBot {
         .setDescription('Pedir una canción')
         .addStringOption(opt =>
           opt.setName('cancion')
-            .setDescription('Nombre o URL de la canción')
+            .setDescription('Nombre o URL de YouTube de la canción')
             .setRequired(true)
         )
         .addStringOption(opt =>
@@ -69,7 +72,10 @@ export class GaspyBot {
           opt.setName('mensaje')
             .setDescription('Mensaje para leer en antena')
             .setRequired(false)
-        )
+        ),
+      new SlashCommandBuilder()
+        .setName('cancelar')
+        .setDescription('Cancela tu última petición en cola')
     ].map(c => c.toJSON());
   }
 
@@ -84,22 +90,38 @@ export class GaspyBot {
   buildStateEmbed(stateOverride = null) {
     const state = stateOverride || this.getCurrentState?.();
     const video = state?.video;
-    const queueItem = this.queue.list()[0] || null;
+    const queueItems = this.queue.list();
+    const queueItem = queueItems[0] || null;
+    const queueSize = queueItems.length;
 
     const embed = new EmbedBuilder()
       .setColor(0x01696f)
       .setTitle(video?.title || 'Sin reproducción')
-      .setDescription(state?.player?.trackState === 1 ? '🔴 Emitiendo ahora' : '⏸ En pausa o sin señal')
+      .setDescription(
+        state?.player?.trackState === 1
+          ? '🔴 Emitiendo ahora'
+          : '⏸ En pausa o sin señal'
+      )
       .addFields(
         { name: 'Artista', value: video?.author || 'Desconocido', inline: true },
         { name: 'Duración', value: formatDuration(video?.durationSeconds || 0), inline: true },
-        { name: 'Próxima petición', value: queueItem ? `${queueItem.song} · de ${queueItem.requestedBy}` : 'Sin peticiones', inline: false }
+        {
+          name: `Próxima petición${queueSize > 1 ? ` (+${queueSize - 1} más)` : ''}`,
+          value: queueItem ? `${queueItem.song} · de ${queueItem.requestedBy}` : 'Sin peticiones',
+          inline: false
+        }
       )
       .setFooter({ text: 'GASPYFM · Sonando ahora' })
       .setTimestamp(new Date());
 
-    const thumb = video?.thumbnails?.[0]?.url;
-    if (thumb) embed.setThumbnail(thumb);
+    const thumb =
+      video?.thumbnails?.[0]?.url ||
+      video?.thumbnail?.url ||
+      null;
+
+    if (thumb) {
+      embed.setThumbnail(thumb);
+    }
 
     return embed;
   }
@@ -108,13 +130,15 @@ export class GaspyBot {
     const state = stateOverride || this.getCurrentState?.();
     const video = state?.video;
     const queueItem = this.queue.list()[0] || null;
+
     return JSON.stringify({
       id: video?.id || '',
       title: video?.title || '',
       author: video?.author || '',
       duration: video?.durationSeconds || 0,
       trackState: state?.player?.trackState || 0,
-      next: queueItem?.song || ''
+      next: queueItem?.song || '',
+      queueSize: this.queue.size()
     });
   }
 
@@ -142,14 +166,8 @@ export class GaspyBot {
         if (existing) return existing;
       }
 
-      const sent = await channel.send({
-        embeds: [this.buildStateEmbed()]
-      });
-
-      this.stateMessage = {
-        channelId: channel.id,
-        messageId: sent.id
-      };
+      const sent = await channel.send({ embeds: [this.buildStateEmbed()] });
+      this.stateMessage = { channelId: channel.id, messageId: sent.id };
       stateStore.write(this.stateMessage);
       logger.info(`Mensaje de estado creado: ${sent.id}`);
       return sent;
@@ -162,17 +180,16 @@ export class GaspyBot {
     }
   }
 
-  async publishState(state = null) {
+  async publishState(state = null, force = false) {
     if (!this.client.isReady()) return;
 
     const key = this.buildStateKey(state);
-    if (key === this.lastPublishedKey) return;
+    if (!force && key === this.lastPublishedKey) return;
 
     const channel = await this.getStateChannel();
     if (!channel) return;
 
     let message = null;
-
     if (this.stateMessage?.messageId) {
       message = await channel.messages.fetch(this.stateMessage.messageId).catch(() => null);
     }
@@ -182,10 +199,7 @@ export class GaspyBot {
       if (!message) return;
     }
 
-    await message.edit({
-      embeds: [this.buildStateEmbed(state)]
-    });
-
+    await message.edit({ embeds: [this.buildStateEmbed(state)] });
     this.lastPublishedKey = key;
   }
 
@@ -195,7 +209,7 @@ export class GaspyBot {
     this.client.once('ready', async () => {
       logger.info(`Discord conectado como ${this.client.user.tag}`);
       await this.ensureStateMessage();
-      await this.publishState();
+      await this.publishState(null, true);
     });
 
     this.client.on('interactionCreate', async (interaction) => {
@@ -206,6 +220,7 @@ export class GaspyBot {
         const title = state?.video?.title || 'Nada claro todavía';
         const author = state?.video?.author || 'Desconocido';
         const dur = formatDuration(state?.video?.durationSeconds || 0);
+
         return interaction.reply({
           content: `🎵 Ahora suena: **${title}** — ${author} \`${dur}\``,
           ephemeral: true
@@ -213,15 +228,35 @@ export class GaspyBot {
       }
 
       if (interaction.commandName === 'cola') {
-        const items = this.queue.list().slice(0, 5);
-        const text = items.length
-          ? items.map((x, i) => `${i + 1}. ${x.song} · ${x.requestedBy}`).join('\n')
-          : 'La cola está vacía.';
-        return interaction.reply({ content: text, ephemeral: true });
+        const items = this.queue.list();
+
+        if (!items.length) {
+          return interaction.reply({
+            content: '📭 La cola está vacía.',
+            ephemeral: true
+          });
+        }
+
+        const lines = items.slice(0, 10).map(
+          (x, i) => `\`${i + 1}.\` **${x.song}** · pedida por ${x.requestedBy}${x.dedicateTo ? ` · para ${x.dedicateTo}` : ''}`
+        );
+
+        if (items.length > 10) {
+          lines.push(`… y ${items.length - 10} más.`);
+        }
+
+        return interaction.reply({
+          content: `📋 **Cola de peticiones (${items.length})**\n${lines.join('\n')}`,
+          ephemeral: true
+        });
       }
 
       if (interaction.commandName === 'boletin') {
-        await interaction.reply({ content: '📰 Boletín lanzado.', ephemeral: true });
+        await interaction.reply({
+          content: '📰 Boletín lanzado.',
+          ephemeral: true
+        });
+
         return this.triggerBulletin();
       }
 
@@ -230,9 +265,14 @@ export class GaspyBot {
         const dedicateTo = interaction.options.getString('dedicar_a') || '';
         const messageText = interaction.options.getString('mensaje') || '';
 
-        if (!this.queue.canRequest(interaction.user.id, env.requestCooldownSeconds)) {
+        const remaining = this.queue.cooldownRemaining(
+          interaction.user.id,
+          env.requestCooldownSeconds
+        );
+
+        if (remaining > 0) {
           return interaction.reply({
-            content: `⏳ Debes esperar ${env.requestCooldownSeconds} segundos entre peticiones.`,
+            content: `⏳ Tienes que esperar **${formatCooldown(remaining)}** antes de pedir otra canción.`,
             ephemeral: true
           });
         }
@@ -248,22 +288,58 @@ export class GaspyBot {
           });
         }
 
+        const resolvedTitle =
+          resolved.song ||
+          resolved.title ||
+          song;
+
+        const resolvedUrl =
+          resolved.url ||
+          (resolved.videoId ? `https://music.youtube.com/watch?v=${resolved.videoId}` : null) ||
+          (resolved.videoId ? `https://www.youtube.com/watch?v=${resolved.videoId}` : null);
+
         const item = this.queue.add({
           userId: interaction.user.id,
           requestedBy: interaction.user.username,
-          song: resolved.title || song,
+          song: resolvedTitle,
           originalInput: song,
           dedicateTo,
           message: messageText.slice(0, env.requestMaxMessageLength),
           videoId: resolved.videoId,
-          sourceUrl: resolved.url,
-          sourceType: resolved.source
+          sourceUrl: resolvedUrl,
+          sourceType: resolved.source || 'unknown'
         });
 
-        await this.publishState();
+        const position = this.queue.size();
+        await this.publishState(null, true);
 
         return interaction.editReply({
-          content: `✅ Petición añadida: **${item.song}**${item.dedicateTo ? ` · dedicada a ${item.dedicateTo}` : ''}`
+          content: [
+            `✅ Petición añadida en posición **#${position}**: **${item.song}**`,
+            item.dedicateTo ? `💌 Dedicada a **${item.dedicateTo}**` : '',
+            resolvedUrl ? `🔗 <${resolvedUrl}>` : ''
+          ].filter(Boolean).join('\n')
+        });
+      }
+
+      if (interaction.commandName === 'cancelar') {
+        const items = this.queue.list();
+        const ownItems = items.filter(x => x.userId === interaction.user.id);
+
+        if (!ownItems.length) {
+          return interaction.reply({
+            content: '📭 No tienes ninguna petición en cola.',
+            ephemeral: true
+          });
+        }
+
+        const last = ownItems[ownItems.length - 1];
+        this.queue.remove(last.id);
+        await this.publishState(null, true);
+
+        return interaction.reply({
+          content: `🗑️ Cancelada tu petición: **${last.song}**`,
+          ephemeral: true
         });
       }
     });

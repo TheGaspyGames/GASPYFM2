@@ -21,6 +21,11 @@ export class RequestQueue {
     return store.read().items;
   }
 
+  /** Número de peticiones en cola */
+  size() {
+    return store.read().items.length;
+  }
+
   add(item) {
     const data = store.read();
     const id = crypto.randomUUID();
@@ -39,9 +44,32 @@ export class RequestQueue {
     return item;
   }
 
-  canRequest(userId, cooldownSeconds) {
+  /**
+   * Elimina una petición por su ID.
+   * Devuelve el item eliminado o null si no se encontró.
+   */
+  remove(id) {
+    const data = store.read();
+    const idx = data.items.findIndex((x) => x.id === id);
+    if (idx === -1) return null;
+    const [removed] = data.items.splice(idx, 1);
+    store.write(data);
+    return removed;
+  }
+
+  /**
+   * Devuelve los segundos restantes de cooldown para un usuario.
+   * Retorna 0 si ya puede pedir.
+   */
+  cooldownRemaining(userId, cooldownSeconds) {
     const data = store.read();
     const last = data.lastByUser[userId] || 0;
-    return Date.now() - last >= cooldownSeconds * 1000;
+    const elapsed = (Date.now() - last) / 1000;
+    const remaining = cooldownSeconds - elapsed;
+    return remaining > 0 ? Math.ceil(remaining) : 0;
+  }
+
+  canRequest(userId, cooldownSeconds) {
+    return this.cooldownRemaining(userId, cooldownSeconds) === 0;
   }
 }
